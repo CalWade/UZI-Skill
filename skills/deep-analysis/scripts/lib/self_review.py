@@ -78,6 +78,35 @@ def check_industry_mapping_sanity(ctx: dict) -> list[Issue]:
     return issues
 
 
+def check_stage1_not_interrupted(ctx: dict) -> list[Issue]:
+    """v3.3.4 · stage1 必须完整收尾 · `_stage1_in_progress` flag 不能残留.
+
+    背景：`collect_raw_data` 每完成 3 个 fetcher 会增量 flush 一次 raw_data.json，
+    如果进程在 wave 2 中途被 kill / Ctrl+C，落盘的 raw_data 里 dimensions 只有
+    部分 fetcher 结果（比如 15 个而不是 20 个），dims 的 keys 看起来"像是完整的
+    缓存"，self-review 只能事后靠 missing-dim 检查发现，但用户经常绕过 review。
+
+    真正的 fix：stage1 入口打 flag，收尾清 flag；self-review 看到 flag 还在就
+    直接 critical，引导用户 `--no-resume` 重跑。
+    """
+    issues: list[Issue] = []
+    raw = ctx.get("raw") or {}
+    if raw.get("_stage1_in_progress") is True:
+        expected = raw.get("_stage1_expected_dims") or []
+        dims = ctx.get("dims") or {}
+        got = sorted(dims.keys())
+        missing = sorted(set(expected) - set(got)) if expected else []
+        issues.append(Issue(
+            severity="critical",
+            category="data",
+            dim="stage1",
+            issue="stage1 未完整收尾（`_stage1_in_progress=True` 残留在 raw_data.json）",
+            evidence=f"dims 数 {len(got)} / 预期 {len(expected)}；missing={missing[:6]}{'...' if len(missing) > 6 else ''}",
+            suggested_fix="进程在 wave 2 被中断 · 执行 `python run.py <ticker> --no-resume` 重跑采集",
+        ))
+    return issues
+
+
 def check_all_dims_exist(ctx: dict) -> list[Issue]:
     """应跑的维度必须都存在 · v2.10.4 · profile-aware (lite 只查启用的维度)."""
     issues = []
@@ -581,6 +610,7 @@ def check_debate_bull_bear_populated(ctx: dict) -> list[Issue]:
 
 CHECKS = [
     check_industry_mapping_sanity,
+    check_stage1_not_interrupted,
     check_all_dims_exist,
     check_empty_dims,
     check_hk_kline_populated,
