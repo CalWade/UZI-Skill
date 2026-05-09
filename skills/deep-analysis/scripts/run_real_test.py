@@ -133,7 +133,14 @@ def collect_raw_data(ticker: str, max_workers: int = 6, resume: bool = True) -> 
             except Exception:
                 pass
         if prev and isinstance(prev.get("dimensions"), dict):
-            cached_dims = prev["dimensions"]
+            # v3.3.4 · 如果上次 stage1 没收尾 (被 Ctrl+C / OOM kill) · 不能复用 dims
+            # 否则用户第二次跑 stage1 会继承半成品（已保存的 dims）+ 空洞（未跑的），
+            # raw_data 看起来完整但实际漏了 N 个 fetcher。
+            if prev.get("_stage1_in_progress") is True:
+                print(f"  [resume] 检测到上次 stage1 被中断 (_stage1_in_progress=True) · 忽略 cache 强制重抓")
+                cached_dims = {}
+            else:
+                cached_dims = prev["dimensions"]
             # 从 cache 也回填 market（它是 fetch_basic 真实抓回来的）
             _cached_market = prev.get("market")
             if _cached_market in ("A", "H", "U"):
@@ -234,9 +241,17 @@ def collect_raw_data(ticker: str, max_workers: int = 6, resume: bool = True) -> 
 
     from concurrent.futures import TimeoutError as _FutureTimeout
     # v2.6 · 增量持久化：每完成 N 个 fetcher 写一次 raw_data.json，crash/Ctrl+C 后 --resume 可续
+    # v3.3.4 · 在 wave2 进行中打标记 `_stage1_in_progress=True`，收尾时清除。
+    # 解决：进程被 kill 后，下游读到"看似完整"但实际只有半数 dim 的 raw_data，
+    # 结果 self-review 没识别就放行 → HTML 报告基于残缺数据生成。
     from lib.cache import write_task_output as _write_cache
     INCREMENTAL_SAVE_EVERY = 3
     completed_count = 0
+    raw["_stage1_in_progress"] = True
+    raw["_stage1_expected_dims"] = sorted(
+        [d for _, d, _ in all_others] + ["0_basic"]
+    )
+
     def _persist_progress():
         raw["dimensions"] = dims
         try:
@@ -356,6 +371,10 @@ def collect_raw_data(ticker: str, max_workers: int = 6, resume: bool = True) -> 
     raw["dimensions"] = dims
     total_elapsed = time.time() - t0
     print(f"\n  Task 1 total: {total_elapsed:.1f}s (wave1 {time.time() - wave1_start:.1f}s + wave2 {wave2_elapsed:.1f}s + wave3 {wave3_elapsed:.1f}s)")
+
+    # v3.3.4 · stage1 全部完成 · 清除 in-progress 标记，下游才认为这是完整缓存
+    raw.pop("_stage1_in_progress", None)
+    raw.pop("_stage1_expected_dims", None)
 
     # v2.7.2 · stage1 收尾再 flush 一次，确保 wave3 的 fund_managers / similar_stocks 也已落盘
     try:
