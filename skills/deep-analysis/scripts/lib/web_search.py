@@ -1,8 +1,11 @@
 """Unified web search wrapper with caching + fallback chain.
 
-Primary: ddgs (DuckDuckGo) — free, no key, works in China via proxy
-Fallback: (future) Tavily / Serper if API keys present
+Provider order (v3.3.5):
+1. Easyclaw (Perplexity Sonar Pro) — if `EASYCLAW_WEB_SEARCH_API_KEY` set;
+   live web + synthesis, far higher quality than ddgs for A-share analysis.
+2. ddgs (DuckDuckGo) — free, no key, works in China via proxy.
 
+Agents can force ddgs-only by `UZI_DISABLE_EASYCLAW=1` if needed.
 All searches go through lib/cache.py so repeated queries are cheap (12h TTL).
 """
 from __future__ import annotations
@@ -157,13 +160,41 @@ def _is_garbage_result(r: dict) -> bool:
     return sum(1 for p in _GARBAGE_PATTERNS if p in text) >= 2
 
 
+def _easyclaw_enabled() -> bool:
+    """True iff Easyclaw key is set AND user hasn't explicitly disabled it."""
+    if os.environ.get("UZI_DISABLE_EASYCLAW") == "1":
+        return False
+    try:
+        from lib.easyclaw_search import is_available
+        return is_available()
+    except Exception:
+        return False
+
+
+def _easyclaw_search(query: str, max_results: int) -> list[dict]:
+    """Thin wrapper around Easyclaw provider · returns list[{title,body,url,source}]."""
+    try:
+        from lib.easyclaw_search import search as _ec_search
+        # Sonar Pro is a synthesis call — max_results maps roughly to token budget
+        results = _ec_search(query, max_tokens=max(800, 200 * max_results))
+        # Filter error stubs so callers can detect "provider failed" by list length
+        ok = [r for r in results if not r.get("error")]
+        return ok
+    except Exception as e:
+        return [{"error": f"easyclaw wrapper crash: {type(e).__name__}: {str(e)[:120]}",
+                 "source": "easyclaw"}]
+
+
 def search(query: str, max_results: int = 10, cache_key_prefix: str = "ws") -> list[dict]:
     """Perform a cached web search. Returns list of {title, body, url, source}.
 
     Includes a quality filter to remove dictionary/Wikipedia garbage results
     that match Chinese character definitions instead of stock analysis.
 
+    Provider priority: Easyclaw (if key set) → ddgs.
+
     v2.10.1 · 命中 cache 的不占预算；未命中 cache 时检查 UZI_DDG_BUDGET 预算。
+    v3.3.5 · Easyclaw 成功时直接返回·不走 ddgs·不占 ddgs 预算。
     """
     key = f"{cache_key_prefix}__{query[:100]}__n{max_results}"
 
@@ -171,6 +202,13 @@ def search(query: str, max_results: int = 10, cache_key_prefix: str = "ws") -> l
     from lib.cache import cached, TTL_HOURLY  # re-import for scope
     # 自定义：先看 cache 有没有，没 cache 时查预算
     def _fetcher():
+        # 1. Easyclaw primary · 如果 key 在且无显式禁用
+        if _easyclaw_enabled():
+            ec = _easyclaw_search(query, max_results)
+            if ec:  # non-empty = 有真实结果
+                return ec
+            # Easyclaw 返空或失败 · fall through to ddgs
+        # 2. ddgs fallback
         if not _budget_allows():
             _budget_mark_skipped()
             return [{"_budget_exceeded": True,
